@@ -1,0 +1,327 @@
+-- ============================================================================
+-- CareerHub - Production Database Schema
+-- ============================================================================
+-- This script creates all necessary tables, policies, indexes, and triggers
+-- for the CareerHub application.
+-- ============================================================================
+
+-- 1. Enable Required Extensions
+-- ============================================================================
+
+-- Enable vector extension for AI/embedding search capabilities
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Enable UUID extension (usually enabled by default, but ensuring it's available)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+
+-- 2. Create the 'profiles' Table (User Profile Data)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.profiles (
+    id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,
+    highest_education TEXT,
+    career_interests TEXT[] DEFAULT ARRAY[]::TEXT[],
+    profile_photo_url TEXT,
+    profile_embedding VECTOR(1536),
+    questionnaire_answers JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Add table comment
+COMMENT ON TABLE public.profiles IS 'Stores user profile information including education, career interests, and AI embeddings';
+
+-- Add column comments
+COMMENT ON COLUMN public.profiles.id IS 'References auth.users(id) - unique user identifier';
+COMMENT ON COLUMN public.profiles.highest_education IS 'User''s highest level of education';
+COMMENT ON COLUMN public.profiles.career_interests IS 'Array of career fields the user is interested in (max 5)';
+COMMENT ON COLUMN public.profiles.profile_photo_url IS 'URL to user profile photo stored in Supabase Storage';
+COMMENT ON COLUMN public.profiles.profile_embedding IS 'Vector embedding for AI-based career recommendations (1536 dimensions)';
+COMMENT ON COLUMN public.profiles.questionnaire_answers IS 'JSONB field storing user questionnaire answers for career recommendations';
+COMMENT ON COLUMN public.profiles.created_at IS 'Timestamp when profile was created';
+COMMENT ON COLUMN public.profiles.updated_at IS 'Timestamp when profile was last updated';
+
+
+-- 3. Create Indexes for 'profiles' Table
+-- ============================================================================
+
+-- Index on profile_embedding for vector similarity search performance
+CREATE INDEX IF NOT EXISTS profiles_profile_embedding_idx 
+ON public.profiles 
+USING ivfflat (profile_embedding vector_cosine_ops)
+WITH (lists = 100);
+
+-- Index on updated_at for querying recent updates
+CREATE INDEX IF NOT EXISTS profiles_updated_at_idx 
+ON public.profiles (updated_at DESC);
+
+
+-- 4. Create Trigger Function to Update 'updated_at' Timestamp
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.handle_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = timezone('utc'::text, now());
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create trigger to automatically update updated_at on profile changes
+DROP TRIGGER IF EXISTS set_profiles_updated_at ON public.profiles;
+CREATE TRIGGER set_profiles_updated_at
+    BEFORE UPDATE ON public.profiles
+    FOR EACH ROW
+    EXECUTE FUNCTION public.handle_updated_at();
+
+
+-- 5. Enable and Apply RLS Policies for 'profiles'
+-- ============================================================================
+
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+-- Policy 1: SELECT (Users can view their own profile)
+DROP POLICY IF EXISTS "Users can select their own profile" ON public.profiles;
+CREATE POLICY "Users can select their own profile" 
+ON public.profiles
+FOR SELECT 
+USING (auth.uid() = id);
+
+-- Policy 2: INSERT (Users can insert their own profile on sign-up)
+DROP POLICY IF EXISTS "Users can insert their own profile" ON public.profiles;
+CREATE POLICY "Users can insert their own profile" 
+ON public.profiles
+FOR INSERT 
+WITH CHECK (auth.uid() = id);
+
+-- Policy 3: UPDATE (Users can update their own profile)
+DROP POLICY IF EXISTS "Users can update their own profile" ON public.profiles;
+CREATE POLICY "Users can update their own profile" 
+ON public.profiles
+FOR UPDATE
+USING (auth.uid() = id)
+WITH CHECK (auth.uid() = id);
+
+-- Policy 4: DELETE (Users can delete their own profile - optional, for data privacy)
+DROP POLICY IF EXISTS "Users can delete their own profile" ON public.profiles;
+CREATE POLICY "Users can delete their own profile" 
+ON public.profiles
+FOR DELETE
+USING (auth.uid() = id);
+
+
+-- 6. Create the 'career_paths' Table (AI Source Data)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.career_paths (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    job_title TEXT NOT NULL,
+    sector TEXT,
+    summary TEXT,
+    required_skills TEXT[],
+    education_level TEXT,
+    salary_range TEXT,
+    embedding VECTOR(1536),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    CONSTRAINT career_paths_job_title_unique UNIQUE (job_title)
+);
+
+-- Add table comment
+COMMENT ON TABLE public.career_paths IS 'Stores career path information with AI embeddings for recommendation matching';
+
+-- Add column comments
+COMMENT ON COLUMN public.career_paths.job_title IS 'Job title or career position name';
+COMMENT ON COLUMN public.career_paths.sector IS 'Industry sector (e.g., Technology, Healthcare, Finance)';
+COMMENT ON COLUMN public.career_paths.summary IS 'Brief description of the career path';
+COMMENT ON COLUMN public.career_paths.required_skills IS 'Array of required or recommended skills';
+COMMENT ON COLUMN public.career_paths.education_level IS 'Recommended education level';
+COMMENT ON COLUMN public.career_paths.salary_range IS 'Typical salary range for this position';
+COMMENT ON COLUMN public.career_paths.embedding IS 'Vector embedding for AI-based matching (1536 dimensions)';
+
+
+-- 7. Create Indexes for 'career_paths' Table
+-- ============================================================================
+
+-- Index on embedding for vector similarity search performance
+CREATE INDEX IF NOT EXISTS career_paths_embedding_idx 
+ON public.career_paths 
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+-- Index on sector for filtering by industry
+CREATE INDEX IF NOT EXISTS career_paths_sector_idx 
+ON public.career_paths (sector);
+
+-- Index on job_title for text search
+CREATE INDEX IF NOT EXISTS career_paths_job_title_idx 
+ON public.career_paths (job_title);
+
+-- Full-text search index on summary (optional, for text-based search)
+CREATE INDEX IF NOT EXISTS career_paths_summary_fts_idx 
+ON public.career_paths 
+USING gin (to_tsvector('english', COALESCE(summary, '')));
+
+
+-- 8. Create Trigger for 'career_paths' updated_at
+-- ============================================================================
+
+DROP TRIGGER IF EXISTS set_career_paths_updated_at ON public.career_paths;
+CREATE TRIGGER set_career_paths_updated_at
+    BEFORE UPDATE ON public.career_paths
+    FOR EACH ROW
+    EXECUTE FUNCTION public.handle_updated_at();
+
+
+-- 9. Apply RLS Policy for 'career_paths' (Public Read Access)
+-- ============================================================================
+
+ALTER TABLE public.career_paths ENABLE ROW LEVEL SECURITY;
+
+-- Policy: Public read access (all authenticated users can view career paths)
+DROP POLICY IF EXISTS "Career paths are public for select" ON public.career_paths;
+CREATE POLICY "Career paths are public for select" 
+ON public.career_paths
+FOR SELECT 
+USING (true);
+
+-- Note: INSERT, UPDATE, DELETE operations on career_paths should be restricted
+-- to admin/service role only. These policies are intentionally omitted here
+-- as they should be managed through Supabase service role or admin functions.
+
+
+-- 10. Create the 'saved_careers' Table (User Saved Careers)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.saved_careers (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    job_title TEXT NOT NULL,
+    sector TEXT,
+    match_score INT,
+    why_it_fits TEXT,
+    skills_you_have TEXT[],
+    skills_to_learn TEXT[],
+    learning_path TEXT[],
+    salary_range TEXT,
+    future_demand TEXT,
+    saved_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    CONSTRAINT saved_careers_user_job_unique UNIQUE (user_id, job_title)
+);
+
+-- Add table comment
+COMMENT ON TABLE public.saved_careers IS 'Stores careers that users have saved for future reference';
+
+-- Add column comments
+COMMENT ON COLUMN public.saved_careers.user_id IS 'References auth.users(id) - the user who saved this career';
+COMMENT ON COLUMN public.saved_careers.job_title IS 'The career/job title that was saved';
+COMMENT ON COLUMN public.saved_careers.match_score IS 'The match score percentage when the career was saved';
+COMMENT ON COLUMN public.saved_careers.saved_at IS 'Timestamp when the career was saved';
+
+-- Create index for faster queries
+CREATE INDEX IF NOT EXISTS saved_careers_user_id_idx 
+ON public.saved_careers (user_id);
+
+-- Enable RLS
+ALTER TABLE public.saved_careers ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policies for saved_careers
+-- Policy 1: SELECT (Users can view their own saved careers)
+DROP POLICY IF EXISTS "Users can select their own saved careers" ON public.saved_careers;
+CREATE POLICY "Users can select their own saved careers" 
+ON public.saved_careers
+FOR SELECT 
+USING (auth.uid() = user_id);
+
+-- Policy 2: INSERT (Users can save careers for themselves)
+DROP POLICY IF EXISTS "Users can insert their own saved careers" ON public.saved_careers;
+CREATE POLICY "Users can insert their own saved careers" 
+ON public.saved_careers
+FOR INSERT 
+WITH CHECK (auth.uid() = user_id);
+
+-- Policy 3: DELETE (Users can remove their saved careers)
+DROP POLICY IF EXISTS "Users can delete their own saved careers" ON public.saved_careers;
+CREATE POLICY "Users can delete their own saved careers" 
+ON public.saved_careers
+FOR DELETE
+USING (auth.uid() = user_id);
+
+-- Create trigger for updated_at (if needed in future)
+-- Note: saved_careers doesn't have updated_at since careers are saved once
+
+
+-- 11. Create Helper Function for Vector Similarity Search (Optional)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.find_similar_careers(
+    user_embedding VECTOR(1536),
+    match_threshold FLOAT DEFAULT 0.7,
+    match_count INT DEFAULT 10
+)
+RETURNS TABLE (
+    id BIGINT,
+    job_title TEXT,
+    sector TEXT,
+    summary TEXT,
+    similarity FLOAT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        cp.id,
+        cp.job_title,
+        cp.sector,
+        cp.summary,
+        1 - (cp.embedding <=> user_embedding) AS similarity
+    FROM public.career_paths cp
+    WHERE 1 - (cp.embedding <=> user_embedding) > match_threshold
+    ORDER BY cp.embedding <=> user_embedding
+    LIMIT match_count;
+END;
+$$;
+
+COMMENT ON FUNCTION public.find_similar_careers IS 'Finds similar career paths based on vector similarity search';
+
+
+-- 11. Grant Necessary Permissions
+-- ============================================================================
+
+-- Grant usage on schema (if needed)
+GRANT USAGE ON SCHEMA public TO authenticated;
+GRANT USAGE ON SCHEMA public TO anon;
+
+-- Grant table permissions
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.profiles TO authenticated;
+GRANT SELECT ON public.career_paths TO authenticated;
+GRANT SELECT ON public.career_paths TO anon;
+
+-- Grant sequence permissions (for career_paths id generation)
+GRANT USAGE, SELECT ON SEQUENCE public.career_paths_id_seq TO authenticated;
+
+
+-- ============================================================================
+-- Schema Creation Complete
+-- ============================================================================
+-- 
+-- Next Steps:
+-- 1. Run this script in your Supabase SQL Editor
+-- 2. Verify all tables, policies, and indexes were created successfully
+-- 3. Test RLS policies with your application
+-- 4. Populate career_paths table with initial data and embeddings
+-- 
+-- IMPORTANT: Storage Policies
+-- ============================================================================
+-- Storage policies for the 'avatars' bucket MUST be created via the Supabase
+-- Dashboard UI, NOT via SQL. You cannot create storage policies via SQL
+-- because you don't have owner permissions on storage.objects table.
+-- 
+-- To set up storage policies:
+-- 1. Go to Storage → avatars bucket → Policies tab
+-- 2. Create policies using the UI (see STORAGE_POLICIES_NO_WITH_CHECK.md)
+-- 
+-- ============================================================================
+
